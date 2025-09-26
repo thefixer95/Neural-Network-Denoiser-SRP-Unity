@@ -1,0 +1,30 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 16f4ac16ff5ffbb4ba445f13d3386dbd, type: 3}
+  m_Name: CRP
+  m_EditorClassIdentifier: 
+  computeShader: {fileID: 7200000, guid: 466ecbba43364ac41abdbe26c20bc1f9, type: 3}
+  skybox: {fileID: 2800000, guid: a763b38b502ceff4d921ea0be8a6ea97, type: 3}
+  illuminationRat: 1
+  multipleRayAA: 0
+  numberOfRays: 5
+  isDenoisingModeOn: 1
+  internalSetup:
+    workerType: 256
+    nnModelSource: {fileID: 5022602860645237092, guid: 739b7649c80f99b4e96d77016b3d1445, type: 3}
+    postNetworkColorBias: {x: 0.4850196, y: 0.4579569, z: 0.4076039, w: 0}
+    forceBilinearUpsample2DInModel: 1
+    channelsOrder: 1
+    shouldSaveStyleTransferDataAsAsset: 0
+    shouldUseSRGBTensor: 0
+    verboseMode: 0
+    tensorToTextureSRGB: {fileID: 7200000, guid: 48e23b96d6c8bb341b0a9ae12da9ab67, type: 3}

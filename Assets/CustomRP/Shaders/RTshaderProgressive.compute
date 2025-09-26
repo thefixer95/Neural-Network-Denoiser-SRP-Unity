@@ -1,0 +1,1044 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result; //result texture color
+
+RWStructuredBuffer<float4> RayOrNEW;
+RWStructuredBuffer<float4> RayDirNEW;
+
+
+RWTexture2D<float4> RayDirMatrix; //matrix of direction of rays
+RWTexture2D<float4> RayDirSign; //matrix of direction of rays
+
+RWTexture2D<float4> RayEnergyMatrix; //matrix of direction of rays
+
+
+
+RWTexture2D<float4> UVResult;
+
+RWTexture2D<float4> ShadowResult;
+
+RWTexture2D<float4> NormalResult;
+
+float3 shadow;
+
+float4x4 CamToWorld;
+float4x4 CamInverseProjection;
+
+bool isMultipleRay;
+int numberRaysPP;
+
+int numberIteration;
+float maxReflections;
+
+//static parameters
+static const float PI = 3.14159265f;
+static const float EPSILON = 1e-8;
+static const float FLT_MAX = 3.402823466e+38f;
+
+//FAKE Randomness in shader
+
+float2 Pixel;
+float randomSeed;
+
+float randomValue()
+{
+    float rNumb = frac(sin(randomSeed / 100.0f * dot(Pixel, float2(12.9898f, 78.2333f))) * 43758.5453f);
+    randomSeed += 1.0f;
+    return rNumb;
+}
+
+
+//skybox
+Texture2D<float4> skybox;
+SamplerState samplerskybox;
+float skyboxIllumination;
+
+//drectionalLight
+float4 directionalLight;
+
+//ray structure
+struct Ray
+{
+    float3 or;
+    float3 dir;
+    
+    //energy of the ray (start at 1, if = 0 stop trace)
+    float3 energy;
+};
+//create ray with or and dir
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.or = origin;
+    ray.dir = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    return ray;
+}
+
+Ray CreateRayWithEnergy(float3 origin, float3 direction, float3 energy)
+{
+    Ray ray;
+    ray.or = origin;
+    ray.dir = direction;
+    ray.energy = energy;
+    return ray;
+}
+
+//create first ray, with camera orientation
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(CamToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+    
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(CamInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(CamToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+
+
+}
+
+//when a ray hits somenthing i need its distance, its position and its normal
+struct RayHit
+{
+    float3 position;
+    float3 normal;
+    float distance;
+    
+    float2 uv;
+    
+    
+    float3 albedo;
+    float3 specular;
+    float smoothness;
+    float3 emission;
+    float materialType;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF; //hit at infinite = hit skybox
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    
+    hit.uv = float2(0.0f, 0.0f);
+    
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    hit.smoothness = 0.0f;
+    hit.emission = float3(0.0f, 0.0f, 0.0f);
+    hit.materialType = 0.0f;
+    return hit;
+}
+
+//sphere obj
+struct Sphere
+{
+    float3 center;
+    float radius;
+    float3 specular;
+    float3 albedo;
+    float smoothness;
+    float3 emission;
+    float materialType;
+};
+
+//array of all spheres from unity
+StructuredBuffer<Sphere> Spheres;
+
+//mesh structures
+struct MeshObject
+{
+    float4x4 localToWorldMat;
+    int indices_offset;
+    int indices_count;
+    float3 specular;
+    float3 albedo;
+    float3 emission;
+    float smoothness;
+    float materialType;
+    
+    float3 centerbb;
+    float3 _minbb;
+    float3 _maxbb;
+};
+
+StructuredBuffer<MeshObject> meshObjects;
+StructuredBuffer<float3> VetexNormals;
+StructuredBuffer<float3> vertices;
+StructuredBuffer<int> indices;
+StructuredBuffer<float2> uvs;
+
+
+//// BVH COMPUTES
+
+struct BVHnodes4CS
+{
+    int leaf;
+    int root;
+    int empty;
+
+    float3 _mibBB;
+    float3 _maxBB;
+    float3 _centerBB;
+    float3 _sizeBB;
+
+       
+    int childrenIndexOffset;
+    int childrenIndexFirstID;
+
+    int fatherIndex;
+
+    int meshIndex;
+    
+    int visited;
+};
+RWStructuredBuffer<BVHnodes4CS> BVH;
+StructuredBuffer<int> BVHidChildren;
+
+//INTERSECT TRIANGLES
+bool IntersectTriangle_MT97(Ray ray, float3 vert0, float3 vert1, float3 vert2,
+    inout float t, inout float u, inout float v)
+{
+    // find vectors for two edges sharing vert0
+    float3 edge1 = vert1 - vert0;
+    float3 edge2 = vert2 - vert0;
+    // begin calculating determinant - also used to calculate U parameter
+    float3 pvec = cross(ray.dir, edge2);
+    // if determinant is near zero, ray lies in plane of triangle
+    float det = dot(edge1, pvec);
+    // use backface culling
+    if (det < EPSILON)
+        return false;
+    float inv_det = 1.0f / det;
+    // calculate distance from vert0 to ray origin
+    float3 tvec = ray.or - vert0;
+    // calculate U parameter and test bounds
+    u = dot(tvec, pvec) * inv_det;
+    if (u < 0.0 || u > 1.0f)
+        return false;
+    // prepare to test V parameter
+    float3 qvec = cross(tvec, edge1);
+    // calculate V parameter and test bounds
+    v = dot(ray.dir, qvec) * inv_det;
+    if (v < 0.0 || u + v > 1.0f)
+        return false;
+    // calculate t, ray intersects triangle
+    t = dot(edge2, qvec) * inv_det;
+    return true;
+}
+
+
+
+// INTERSECT WITH BVH and BVH search
+
+//Intersec with box
+bool IntersectBoundingBox(BVHnodes4CS BB, Ray r, inout float t)
+{
+    //if the ray doesnt hit the mesh stop
+    //float tmin, tmax, tymin, tymax, tzmin, tzmax;
+ 
+    //tmin = (BB._mibBB.x - r.or.x) / r.dir.x;
+    //tmax = (BB._maxBB.x - r.or.x) / r.dir.x;
+    //tymin = (BB._mibBB.y - r.or.y) / r.dir.y;
+    //tymax = (BB._maxBB.y - r.or.y) / r.dir.y;
+ 
+    //if ((tmin > tymax) || (tymin > tmax)) 
+    //    return false;
+ 
+    //if (tymin > tmin) 
+    //    tmin = tymin;
+    //if (tymax < tmax) 
+    //    tmax = tymax;
+ 
+    //tzmin = tzmin = (BB._mibBB.z - r.or.z) / r.dir.z;
+    //tzmax = tzmax = (BB._maxBB.z - r.or.z) / r.dir.z;
+ 
+    //if ((tmin > tzmax) || (tzmin > tmax)) 
+    //    return false;
+ 
+    //if (tzmin > tmin) 
+    //    tmin = tzmin;
+    //if (tzmax < tmax) 
+    //    tmax = tzmax;
+ 
+    //t = tmin;
+ 
+    //if (t < 0)
+    //{
+    //    t = tmax;
+    //    if (t < 0)
+    //        return false;
+    //}
+ 
+    //return true;
+
+    //float tmin = (BB._mibBB.x - r.or.x) / r.dir.x;
+    //float tmax = (BB._maxBB.x - r.or.x) / r.dir.x;
+ 
+    //if (tmin > tmax)
+    //{
+    //    tmin = tmax;
+    //    tmax = (BB._mibBB.x - r.or.x) / r.dir.x;
+    //}
+    //float tymin = (BB._mibBB.y - r.or.y) / r.dir.y;
+    //float tymax = (BB._maxBB.y - r.or.y) / r.dir.y;
+ 
+    //if (tymin > tymax)
+    //{
+    //    tymin = tymax;
+    //    tymax = (BB._mibBB.y - r.or.y) / r.dir.y;
+    //}
+ 
+    //float tzmin = (BB._mibBB.z - r.or.z) / r.dir.z;
+    //float tzmax = (BB._maxBB.z - r.or.z) / r.dir.z;
+ 
+    //if (tzmin > tzmax)
+    //{
+    //    tzmin = tzmax;
+    //    tzmax = (BB._mibBB.z - r.or.z) / r.dir.z;
+    //}
+    
+    //if (((tmin > tymax) || (tymin > tmax)) || ((tmin > tzmax) || (tzmin > tmax)))
+    //{
+    //    //NOT INTERSECTED
+    //    return false;
+    //}
+    //else
+    //{
+
+    //    if (tmax < 0)
+    //    {
+    //        t = tmax;
+    //        return false;
+    //    }
+
+    //    // if tmin > tmax, ray doesn't intersect AABB
+    //    if (tmin > tmax)
+    //    {
+    //        t = tmax;
+    //        return false;
+    //    }
+
+    //    t = tmin;
+    //    //INTERSECTED
+    //    return true;
+    //}
+    
+    float3 dirfrac;
+    // r.dir is unit direction vector of ray
+    dirfrac.x = 1.0f / r.dir.x;
+    dirfrac.y = 1.0f / r.dir.y;
+    dirfrac.z = 1.0f / r.dir.z;
+// lb is the corner of AABB with minimal coordinates - left bottom, rt is maximal corner
+// r.org is origin of ray
+    float t1 = (BB._mibBB.x - r.or.x) * dirfrac.x;
+    float t2 = (BB._maxBB.x - r.or.x) * dirfrac.x;
+    float t3 = (BB._mibBB.y - r.or.y) * dirfrac.y;
+    float t4 = (BB._maxBB.y - r.or.y) * dirfrac.y;
+    float t5 = (BB._mibBB.z - r.or.z) * dirfrac.z;
+    float t6 = (BB._maxBB.z - r.or.z) * dirfrac.z;
+
+    float tmin = max(max(min(t1, t2), min(t3, t4)), min(t5, t6));
+    float tmax = min(min(max(t1, t2), max(t3, t4)), max(t5, t6));
+
+    if ((tmin > tmax) || tmax < 0)
+    {
+        return false;
+    }
+    else
+    {
+// if tmin < 0 then the ray origin is inside of the AABB and tmin is behind the start of the ray so tmax is the first intersection
+        //if (tmin < 0)
+        //{
+        //    t = tmax;
+        //}
+        //else
+        //{
+        //    t = tmin;
+        //}
+        return true;
+    }
+}
+
+void FindIntersectionInMesh(Ray r, inout RayHit bestHit, MeshObject mObj)
+{
+    uint offset = mObj.indices_offset;
+    uint count = offset + mObj.indices_count;
+    
+    for (uint i = offset; i < count; i += 3)   //parse triangles
+    {
+        float3 v0 = (mul(mObj.localToWorldMat, float4(vertices[indices[i]], 1))).xyz;
+        float3 v1 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 1]], 1))).xyz;
+        float3 v2 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 2]], 1))).xyz;
+
+        float t, u, v;
+        
+        if (IntersectTriangle_MT97(r, v0, v1, v2, t, u, v))
+        {
+            if (t > 0 && t < bestHit.distance)
+            {
+                float3 n0 = VetexNormals[indices[i]];
+                float3 n1 = VetexNormals[indices[i + 1]];
+                float3 n2 = VetexNormals[indices[i + 2]];
+                    
+                float2 uv0 = uvs[indices[i]];
+                float2 uv1 = uvs[indices[i + 1]];
+                float2 uv2 = uvs[indices[i + 2]];
+                    
+                bestHit.uv = (1 - u - v) * uv0 + u * uv1 + u * uv2;
+                    //bestHit.uv = (uv0 + uv1 + uv2) / 3;
+                    
+                bestHit.distance = t;
+                bestHit.position = r.or + t * r.dir;
+                    //bestHit.normal = normalize(cross(v1 - v0, v2 - v0));
+                bestHit.normal = (1 - u - v) * n0 + u * n1 + v * n2;
+                bestHit.albedo = mObj.albedo;
+                bestHit.specular = mObj.specular;
+                bestHit.smoothness = mObj.smoothness;
+                bestHit.emission = 0;
+                bestHit.materialType = mObj.materialType;
+            }
+        }
+    }
+}
+
+
+//BVH usage
+void BVHIntersection(Ray r, inout RayHit bestHit)
+{
+    float distanceIntersection = 0;
+    
+    //check if intersect with root
+    if (!IntersectBoundingBox(BVH[0], r, distanceIntersection))
+    {
+        //ray does not intersect with anything in the BVH
+        return;
+    }
+    else
+    {
+        //int meshesIDs[500];
+        //for (int id = 0; id < 500; id++)
+        //    meshesIDs[id] = -1;
+        
+        //int meshCount = 0;
+        
+        
+        
+        //find the meshes that are hitten (leafs)
+        //bool foundLeaf = false;
+        bool noHit = true;
+        //int meshId = 0;
+        
+        int kElOfBVH = 0;
+        
+        int boxHitten = 0;
+        
+        //NEW BVH??
+        
+        BVHnodes4CS realHit;
+        
+        float realHitDist = FLT_MAX;
+        
+        bool thereAreNonVisited = true;
+        
+        while (thereAreNonVisited)
+        {
+            bool hitABox = false;
+            
+            float distanceOfHit = FLT_MAX;
+            
+            for (int i = BVH[kElOfBVH].childrenIndexFirstID; i < BVH[kElOfBVH].childrenIndexFirstID + BVH[kElOfBVH].childrenIndexOffset; i++)
+            {
+                if (BVH[BVHidChildren[i]].visited<1)
+                {
+                    if (IntersectBoundingBox(BVH[BVHidChildren[i]], r, distanceIntersection)) //se ha colpito un bb controllare se il successivo è più vicino o più lontano o non lo colpisce (per ora primo che colpisce è quello preso)
+                    {
+                        if (distanceIntersection < distanceOfHit)
+                            distanceOfHit = distanceIntersection;
+                        hitABox = true;
+                        boxHitten = BVHidChildren[i];
+                    }
+                    else
+                    {
+                        BVH[BVHidChildren[i]].visited = 1;
+                    }
+                }
+            }
+            //se ho visitato tutti i figli e sono la radice -> esco            
+            if (!hitABox && kElOfBVH == 0)   //clausola di uscita
+            {
+                thereAreNonVisited = false;
+            }
+            else
+            {
+                if (BVH[boxHitten].leaf)
+                {
+                    BVH[boxHitten].visited = 1;
+                    kElOfBVH = 0;
+                    if (distanceOfHit < realHitDist)
+                    {
+                        realHit = BVH[boxHitten];
+                        realHitDist = distanceOfHit;
+                    }
+                    noHit = false;
+                }
+                else
+                {
+                    kElOfBVH = boxHitten;
+                }
+            }
+        }
+        if (noHit)
+        {
+            //nessuna intersezione (falso positivo)
+            return;
+        }
+        else
+        {
+            //intersezione con la mash
+            FindIntersectionInMesh(r, bestHit, meshObjects[BVH[boxHitten].meshIndex]);
+        }
+        
+        
+        
+        //while (!foundLeaf)
+        //{
+        //    float lastIntersection = FLT_MAX;
+        //    bool hitABox = false;
+            
+        //    //intersect with all children of the BB
+        //    for (int i = BVH[kElOfBVH].childrenIndexFirstID; i < BVH[kElOfBVH].childrenIndexFirstID + BVH[kElOfBVH].childrenIndexOffset; i++)
+        //    {
+        //        if (IntersectBoundingBox(BVH[BVHidChildren[i]], r, distanceIntersection)) //se ha colpito un bb controllare se il successivo è più vicino o più lontano o non lo colpisce (per ora primo che colpisce è quello preso)
+        //        {
+        //            hitABox = true;
+        //            boxHitten = BVHidChildren[i];
+        //        }
+                
+        //    }
+            
+        //    if (!hitABox)
+        //    {
+        //        foundLeaf = true;
+        //    }
+        //    else
+        //    {
+        //        if (BVH[boxHitten].leaf)
+        //        {
+        //            meshId = BVH[boxHitten].meshIndex;
+        //            meshesIDs[meshCount] = meshId;
+        //            meshCount++;
+        //            foundLeaf = true;
+        //        }
+        //        else
+        //        {
+        //            kElOfBVH = boxHitten;
+        //        }
+        //    }
+        //}
+        //if (noHit)
+        //{
+        //    //nessuna intersezione (falso positivo)
+        //    return;
+        //}
+        //else
+        //{
+        //    //intersezione con la mash
+        //    FindIntersectionInMesh(r, bestHit, meshObjects[meshId]);
+        //}
+    }
+}
+
+
+
+
+
+
+
+
+//Start simple: planes/spheres
+void IntersectGroundPlane(Ray r, inout RayHit bestHit)
+{
+    float t = -r.or.y / r.dir.y; //distance of hit object (the infinite plane is in y=0)
+    
+    if (t > 0 && t < bestHit.distance)
+    {
+        bestHit.distance = t;
+        bestHit.position = r.or + t * r.dir;
+        bestHit.normal = float3(0.0f, 1.0f, 0.0f);
+        bestHit.specular = float3(0.04f, 0.04f, 0.04f);
+        bestHit.albedo = float3(0.30f, 0.23f, 0.20f);
+        bestHit.smoothness = 0.5;
+        bestHit.emission = float3(0, 0, 0);
+        bestHit.materialType = 1;
+    }
+}
+
+
+void IntersectSphere(Ray r, inout RayHit bestHit, Sphere sphere)
+{
+    float3 d = r.or - sphere.center;
+    float p1 = -dot(r.dir, d);
+    float p2sqr = p1 * p1 - dot(d, d) + sphere.radius * sphere.radius; //discriminante
+    
+    if (p2sqr < 0) //se il discriminante è minore di zero allora non tocca la sfera
+    {
+        return;
+    }
+    //se la tocca devo controllare se la tocca da dietro a davanti o viceversa e se è la più davanti
+    float p2 = sqrt(p2sqr);
+    float t = p1 - p2 > 0 ? p1 - p2 : p1 + p2; //se p1-p2 > 0 -> t = p1-p2   altrimenti t = p1+p2 (tiene conto del fatto che uno dei due punti potrebbe essere <0
+    
+    if (t > 0 && t < bestHit.distance)      //se è il migliore allora regisro i dati della collisione
+    {
+        bestHit.distance = t;
+        bestHit.position = r.or + t * r.dir; //posizione di partenza del raggio riflesso
+        bestHit.normal = normalize(bestHit.position - sphere.center); //la normale della tangente in quel punto
+        bestHit.specular = sphere.specular;
+        bestHit.albedo = sphere.albedo;
+        bestHit.smoothness = sphere.smoothness;
+        bestHit.emission = sphere.emission;
+        bestHit.materialType = sphere.materialType;
+    }
+
+}
+
+
+
+
+//for shading use Gouraud shading: normal vertex linear interpolation
+void IntersectMeshNormalObjs(Ray r, inout RayHit bestHit, MeshObject mObj)
+{
+    //if the ray doesnt hit the mesh stop
+
+    float tmin = (mObj._minbb.x - r.or.x) / r.dir.x;
+    float tmax = (mObj._maxbb.x - r.or.x) / r.dir.x;
+ 
+    if (tmin > tmax)
+    {
+        tmin = tmax;
+        tmax = (mObj._minbb.x - r.or.x) / r.dir.x;
+    }
+    float tymin = (mObj._minbb.y - r.or.y) / r.dir.y;
+    float tymax = (mObj._maxbb.y - r.or.y) / r.dir.y;
+ 
+    if (tymin > tymax)
+    {
+        tymin = tymax;
+        tymax = (mObj._minbb.y - r.or.y) / r.dir.y;
+    }
+ 
+    float tzmin = (mObj._minbb.z - r.or.z) / r.dir.z;
+    float tzmax = (mObj._maxbb.z - r.or.z) / r.dir.z;
+ 
+    if (tzmin > tzmax)
+    {
+        tzmin = tzmax;
+        tzmax = (mObj._minbb.z - r.or.z) / r.dir.z;
+    }
+    
+    if (((tmin > tymax) || (tymin > tmax)) || ((tmin > tzmax) || (tzmin > tmax)))
+    {
+        return;
+    }
+    else
+    {
+    
+    
+    //else check the triangle
+        
+        uint offset = mObj.indices_offset;
+        uint count = offset + mObj.indices_count;
+    
+        for (uint i = offset; i < count; i += 3)   //parse triangles
+        {
+            float3 v0 = (mul(mObj.localToWorldMat, float4(vertices[indices[i]], 1))).xyz;
+            float3 v1 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 1]], 1))).xyz;
+            float3 v2 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 2]], 1))).xyz;
+
+            float t, u, v;
+        
+            if (IntersectTriangle_MT97(r, v0, v1, v2, t, u, v))
+            {
+                if (t > 0 && t < bestHit.distance)
+                {
+                //check the normal
+                    //float3 n0 = (mul(mObj.localToWorldMat, float4(VetexNormals[indices[i]], 1))).xyz;
+                    //float3 n1 = (mul(mObj.localToWorldMat, float4(VetexNormals[indices[i + 1]], 1))).xyz;
+                    //float3 n2 = (mul(mObj.localToWorldMat, float4(VetexNormals[indices[i + 2]], 1))).xyz;
+                    float3 n0 = VetexNormals[indices[i]];
+                    float3 n1 = VetexNormals[indices[i + 1]];
+                    float3 n2 = VetexNormals[indices[i + 2]];
+                    
+                    float2 uv0 = uvs[indices[i]];
+                    float2 uv1 = uvs[indices[i + 1]];
+                    float2 uv2 = uvs[indices[i + 2]];
+                    
+                    bestHit.uv = (1 - u - v) * uv0 + u * uv1 + u * uv2;
+                    //bestHit.uv = (uv0 + uv1 + uv2) / 3;
+                    
+                    bestHit.distance = t;
+                    bestHit.position = r.or + t * r.dir;
+                    //bestHit.normal = normalize(cross(v1 - v0, v2 - v0));
+                    bestHit.normal = (1 - u - v) * n0 + u * n1 + v * n2;
+                    bestHit.albedo = mObj.albedo;
+                    bestHit.specular = mObj.specular;
+                    bestHit.smoothness = mObj.smoothness;
+                    bestHit.emission = 0;
+                    bestHit.materialType = mObj.materialType;
+                }
+            }
+        }
+    }
+}
+
+
+void IntersectMeshObjs(Ray r, inout RayHit bestHit, MeshObject mObj)
+{
+        //if the ray doesnt hit the mesh stop
+
+    float tmin = (mObj._minbb.x - r.or.x) / r.dir.x;
+    float tmax = (mObj._maxbb.x - r.or.x) / r.dir.x;
+ 
+    if (tmin > tmax)
+    {
+        tmin = tmax;
+        tmax = (mObj._minbb.x - r.or.x) / r.dir.x;
+    }
+    float tymin = (mObj._minbb.y - r.or.y) / r.dir.y;
+    float tymax = (mObj._maxbb.y - r.or.y) / r.dir.y;
+ 
+    if (tymin > tymax)
+    {
+        tymin = tymax;
+        tymax = (mObj._minbb.y - r.or.y) / r.dir.y;
+    }
+ 
+    float tzmin = (mObj._minbb.z - r.or.z) / r.dir.z;
+    float tzmax = (mObj._maxbb.z - r.or.z) / r.dir.z;
+ 
+    if (tzmin > tzmax)
+    {
+        tzmin = tzmax;
+        tzmax = (mObj._minbb.z - r.or.z) / r.dir.z;
+    }
+    
+    if (((tmin > tymax) || (tymin > tmax)) || ((tmin > tzmax) || (tzmin > tmax)))
+    {
+    }
+    else
+    {
+    
+        uint offset = mObj.indices_offset;
+        uint count = offset + mObj.indices_count;
+    
+        for (uint i = offset; i < count; i += 3)   //parse triangles
+        {
+            float3 v0 = (mul(mObj.localToWorldMat, float4(vertices[indices[i]], 1))).xyz;
+            float3 v1 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 1]], 1))).xyz;
+            float3 v2 = (mul(mObj.localToWorldMat, float4(vertices[indices[i + 2]], 1))).xyz;
+
+            float t, u, v;
+        
+            if (IntersectTriangle_MT97(r, v0, v1, v2, t, u, v))
+            {
+                if (t > 0 && t < bestHit.distance)
+                {
+                    bestHit.distance = t;
+                    bestHit.position = r.or + t * r.dir;
+                    bestHit.normal = normalize(cross(v1 - v0, v2 - v0));
+                    bestHit.albedo = mObj.albedo;
+                    bestHit.specular = mObj.specular;
+                    bestHit.smoothness = mObj.smoothness;
+                    bestHit.emission = 0.0f;
+                    bestHit.materialType = mObj.materialType;
+                }
+            }
+        }
+    }
+}
+
+
+RayHit Traceing(Ray r)
+{
+    RayHit bestHit = CreateRayHit();
+    
+    uint numObjs, stride, i;
+        
+    IntersectGroundPlane(r, bestHit);
+    
+    //trace all spheres in buffer Spheres
+    Spheres.GetDimensions(numObjs, stride); //take dimension of arrayBuffer
+    for (i = 0; i < numObjs; i++)
+    {
+        IntersectSphere(r, bestHit, Spheres[i]); //-----------it can maybe be enhanced !!!!!!
+    }
+    
+    //trace all meshes in buffer meshes
+    meshObjects.GetDimensions(numObjs, stride);
+    for (i = 0; i < numObjs; i++)
+    {
+        //IntersectMeshObjs(r, bestHit, meshObjects[i]);
+        IntersectMeshNormalObjs(r, bestHit, meshObjects[i]);
+    }
+    
+    //BVHIntersection(r, bestHit);
+    
+    
+    return bestHit;
+}
+
+
+// HERE FOR LAMBERTIAN
+// hemisphere sampling for random ray in random direction (random sphere r=1)
+// genero tre vettori ortogonali in cui la normale è il vettore Z così da passare al sampleHemisph per fare il random sui valori della normale uscente
+float3x3 GetTangentSpace(float3 normal)
+{
+    float3 helper = float3(1, 0, 0); //vettore che utilizziamo per generare la tangente, se è troppo allineato alla normale lo cambio a Z
+    if (abs(normal.x) > 0.99f)
+    {
+        helper = float3(0, 0, 1);
+    }
+    //generate vectors (tangent, binomial)
+    float3 tg = normalize(cross(normal, helper)); //x
+    float3 bin = normalize(cross(normal, tg)); //y, normal = z
+    
+    return float3x3(tg, bin, normal);
+}
+
+float3 SampleHemisph(float3 norm, float alpha)   //this output the random direction of the new ray
+{
+    float cosTh = pow(randomValue(), 1.0f / (alpha + 1.0f)); //take random value
+    float sinTh = sqrt(1.0f - cosTh * cosTh);
+    float phi = 2 * PI * randomValue();
+    float3 tangentSpaceDirection = float3(cos(phi) * sinTh, sin(phi) * sinTh, cosTh); //questo è generato attorno all'asse positivo Z, lo rimappo sulla mia normale
+
+    //transform to world space with normal
+    return mul(tangentSpaceDirection, GetTangentSpace(norm));
+
+}
+
+float sdot(float3 x, float3 y, float f = 1.0f) //result of the dot product, with an optional factor and then clamped to [0,1]
+{
+    return saturate(dot(x, y) * f);
+
+}
+
+float energy(float3 color)
+{
+    return dot(color, 1.0f / 3.0f);
+
+}
+
+//function used to change from smoothnes Unity style to alpha Phong style
+float SmoothnessToPhongAlpha(float s)
+{
+    return pow(1000.0f, s * s);
+}
+
+
+float3 Shade(inout Ray rIn, RayHit hit)
+{
+    if (hit.distance < 1.#INF)      //something hit
+    {
+        if (hit.materialType < 0.5f)
+        {
+        //diffuse shading Lambert
+            //LAMBERT TYPE  //not metal ?
+            rIn.or = hit.position + hit.normal * 0.001f;
+            rIn.dir = SampleHemisph(hit.normal, 1.0f);
+            rIn.energy *= 2 * hit.albedo * sdot(hit.normal, rIn.dir);
+        }
+        else if (hit.materialType >= 0.5f)
+        {
+            //PHONG TYPE //metal ?
+            hit.albedo = min(1.0 - hit.specular, hit.albedo);
+            float specChance = energy(hit.specular);
+            float diffChance = energy(hit.albedo);
+            float sum = specChance + diffChance;
+            specChance /= sum;
+            diffChance /= sum;
+            
+            float roulette = randomValue();
+            if (roulette < specChance)
+            {
+                //specular reflection
+                float alpha = SmoothnessToPhongAlpha(hit.smoothness);
+                rIn.or = hit.position + hit.normal * 0.001f;
+                rIn.dir = SampleHemisph(reflect(rIn.dir, hit.normal), alpha);
+                float f = (alpha + 2) / (alpha + 1);
+                rIn.energy *= (1.0f / specChance) * hit.specular * sdot(hit.normal, rIn.dir, f);
+            }
+            else
+            {
+                //diffuse reflection
+                rIn.or = hit.position + hit.normal * 0.001f;
+                rIn.dir = SampleHemisph(hit.normal, 1.0f);
+                rIn.energy *= (1.0f / diffChance) * hit.albedo;
+            }
+        }
+        
+        //shadow casting with specific rays
+        bool shadow = false;
+        Ray shadowRay = CreateRay(hit.position + hit.normal * 0.001f, -1 * directionalLight.xyz);
+        RayHit shadowHit = Traceing(shadowRay);
+        
+        if (shadowHit.distance != 1.#INF)
+        {
+            return hit.emission;
+        }
+        //return nothing, the color will be returned at the end of the total shading
+        return (hit.emission + hit.albedo * saturate(dot(hit.normal, directionalLight.xyz) * -1) * directionalLight.w);
+        //return 0.0f;
+        
+        //shade according to hits
+        //return hit.normal * 0.5f + 0.5f;
+        
+        //return hit.emission;
+    }
+    else
+    {
+        //energy is 0
+        rIn.energy = 0.0f;
+               
+        //shade according to skybox
+        //sample skybox with ray
+        float theta = acos(rIn.dir.y) / -PI;
+        float phi = atan2(rIn.dir.x, -rIn.dir.z) / -PI * 0.5f;
+        return skybox.SampleLevel(samplerskybox, float2(phi, theta), 0).xyz * skyboxIllumination;
+    }
+}
+
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    
+    uint width, height;
+    Result.GetDimensions(width, height);
+    
+    float2 px = id.xy;
+    int pxValue = id.y + id.x * height;
+    
+    if (RayDirNEW[pxValue].w < 1)
+    {
+    //random parameter
+    //float Pixel = id.xy + float2(randomValue(), randomValue());
+        Pixel = id.xy;
+    
+    
+
+
+    //pixel remap to -1 a 1 range
+        float2 uv = float2((px + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+
+    //first ray or successive ray
+        Ray ray;
+        if (RayOrNEW[pxValue].w < 1)            //4th parameter of ORIGIN matrix states if this is the first pass or not: if ***[px].w < 1 then it is the first else go on using the stored parameters 
+            ray = CreateCameraRay(uv);
+        else
+        {
+            float3 rOr = RayOrNEW[pxValue].xyz;
+            
+            float3 rDir = RayDirNEW[pxValue].xyz;
+        
+            
+            
+            ray = CreateRayWithEnergy(rOr, rDir, RayEnergyMatrix[px].xyz);
+        }
+    
+    
+    
+        bool multiRayAA = false;
+    
+    
+    //output
+        float3 colorPx = Result[px].xyz;
+    
+        if (isMultipleRay)
+        {
+        //the ray is a trace of hits, if it hit the energy decreese and the color change.
+            float maxReflections = 8;
+            float rayXpx = numberRaysPP;
+            for (int rN = 0; rN < rayXpx; rN++)
+            {
+                ray = CreateCameraRay(uv);
+                for (int i = 0; i < maxReflections; i++)
+                {
+                    RayHit hit = Traceing(ray);
+                    colorPx += ray.energy * Shade(ray, hit); //the result is the shading of the ray hitting things (1 is max, it is energy) the energy decrease each hit in order to the specular of the material hit
+
+                    if (i < 1)
+                    {
+                        UVResult[id.xy] = float4(hit.uv, 1, 1);
+                    //UVResult[id.xy] = float4(hit.normal, 1);
+                
+                        NormalResult[id.xy] = float4(hit.normal, 1);
+                
+                
+                        if (!any(ray.energy))
+                        {
+                            shadow = 1;
+                            ShadowResult[id.xy] = float4(shadow, 1);
+                            break;
+                        }
+                    }
+                
+                    shadow = -((i / maxReflections) - 1);
+                    shadow += hit.emission;
+                    ShadowResult[id.xy] = float4(shadow, 1);
+                
+        //if run out of energy break
+                    if (!any(ray.energy))
+                        break;
+                }
+            }
+            colorPx /= rayXpx;
+        }
+        else
+        {
+    
+    //the ray is a trace of hits, if it hit the energy decreese and the color change.            
+            RayHit hit = Traceing(ray);
+            //float3 shadowPx = Shade(ray, hit);
+            colorPx += ray.energy * Shade(ray, hit); //the result is the shading of the ray hitting things (1 is max, it is energy) the energy decrease each hit in order to the specular of the material hit
+            
+            if (!any(ray.energy))
+            {
+                RayOrNEW[pxValue] = float4(0, 0, 0, 1);
+                RayDirNEW[pxValue] = float4(0, 0, 0, 1);
+                shadow = 1;
+                ShadowResult[id.xy] = float4(shadow, 1);
+            }
+            else
+            {
+                
+                RayOrNEW[pxValue] = float4(ray.or, 1);
+                
+                RayDirNEW[pxValue] = float4(ray.dir, 0);
+                RayEnergyMatrix[px] = float4(ray.energy, 0);
+                
+                shadow = -((numberIteration / maxReflections) - 1);
+                shadow += hit.emission;
+                ShadowResult[id.xy] = float4(shadow, 1);
+            }
+            if (numberIteration < 1)
+            {
+                UVResult[id.xy] = float4(hit.uv, 1, 1);
+                //UVResult[id.xy] = float4(hit.normal, 1);
+                
+                NormalResult[id.xy] = float4(hit.normal * 0.5f + 0.5f, 1);
+            }
+        }
+        Result[id.xy] = float4(colorPx, 1);
+    }
+    //else
+        //Result[id.xy] = Result[id.xy];
+}

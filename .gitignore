@@ -73,3 +73,19 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+/Assets/Graphy - Ultimate Stats Monitor
+*.mtl
+*.obj
+*.fbx
+*.mtl.meta
+*.fbx.meta
+*.obj.meta
+*.onnx
+*.onnx.meta
+*.png
+*.png.meta
+*.hdr
+*.hdr.meta
+*.jpg
+*.jpg.meta
+/Assets/TextMesh Pro
